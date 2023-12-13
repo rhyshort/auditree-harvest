@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Harvest file collator."""
+import json
 import os
 import shutil
 import tempfile
@@ -63,41 +64,49 @@ class Collator(object):
         :returns: A list of Commit objects
         """
         self.checkout()
-        commits = []
+        commits = {}
         current_date = until_dt + timedelta(days=1)
-        while current_date > from_dt:
-            try:
-                commit = next(
-                    self.git_repo.iter_commits(
-                        paths=filepath, until=current_date, max_count=1
+
+        expanded_file_paths = self._get_locker_file_paths(filepath)
+        for ex_filepath in expanded_file_paths:
+            while current_date > from_dt:
+                try:
+                    commit = next(
+                        self.git_repo.iter_commits(
+                            paths=ex_filepath, until=current_date, max_count=1
+                        )
                     )
-                )
-                commits.append(commit)
-                current_date = datetime.strptime(
-                    self._ts_to_str(commit.committed_date), "%Y%m%d"
-                )
-            except StopIteration:
-                break
+                    commits[commit.hexsha] = commit
+                    current_date = datetime.strptime(
+                        self._ts_to_str(commit.committed_date), "%Y%m%d"
+                    )
+                except StopIteration:
+                    break
         if not commits:
             until = until_dt.strftime("%Y-%m-%d")
             since = from_dt.strftime("%Y-%m-%d")
             raise FileMissingError(f"{filepath} not found between {since} and {until}")
-        return commits
 
-    def write(self, filepath, commits):
+        return commits.values()
+
+    def write(self, filepath, commits: list[git.Commit]):
         """
         Create file artifacts.
 
         :param str filepath: The relative path to the file within the repo
         :param list commits: A list of commits for a given file and date range
         """
+        expanded_file_paths = self._get_locker_file_paths(filepath)
         for commit in commits:
-            file_name = (
-                f"./{self._ts_to_str(commit.committed_date)}_"
-                f'{filepath.rsplit("/", 1).pop()}'
-            )
-            with open(file_name, "w+") as f:
-                f.write(commit.tree[filepath].data_stream.read().decode())
+            for ex_filepath in expanded_file_paths:
+                file_name = (
+                    f"./{self._ts_to_str(commit.committed_date)}_"
+                    f'{ex_filepath.rsplit("/", 1).pop()}'
+                )
+                # need to check if the file is present in the commit first
+                if ex_filepath in commit.tree:
+                    with open(file_name, "w+") as f:
+                        f.write(commit.tree[ex_filepath].data_stream.read().decode())
 
     def checkout(self):
         """Establish/Refresh the local Git repository."""
@@ -145,3 +154,22 @@ class Collator(object):
 
     def _ts_to_str(self, timestamp):
         return datetime.fromtimestamp(timestamp).strftime("%Y%m%d")
+
+    def _get_locker_file_paths(self, filepath: str):
+        dir = os.path.dirname(filepath)
+        indexFile = os.path.join(dir, "index.json")
+        requestedFileName = os.path.basename(filepath)
+        index = json.load(self.git_repo.tree()[indexFile].data_stream)
+
+        file_info = index[requestedFileName]
+        partitions = file_info.get("partitions", None)
+
+        if not partitions:
+            return [filepath]
+
+        # generate the list of file names we need to read
+        filepaths = []
+        for partition in partitions.keys():
+            filepaths.append(os.path.join(dir, f"{partition}_{requestedFileName}"))
+
+        return filepaths
